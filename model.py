@@ -31,10 +31,7 @@ class GPTNeoXForDoubleCausalLM(torch.nn.Module):
         self.embed_adapter = embed_adapter
         self.unembed_adapter = unembed_adapter
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError()
-
-    def get_ntp_losses(self, input_ids_left: torch.Tensor, input_ids_right: torch.Tensor):
+    def forward(self, input_ids_left: torch.Tensor, input_ids_right: torch.Tensor):
         embeds_left = self.backbone.gpt_neox.embed_in(input_ids_left)
         embeds_right = self.embed_adapter(self.backbone.gpt_neox.embed_in(input_ids_right))
 

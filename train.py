@@ -161,7 +161,7 @@ log_file = "log.txt"
 Path(log_file).write_text("")
 
 
-@ray.remote(num_gpus=1)
+# @ray.remote(num_gpus=1)
 def train(
     run_name: str,
     train_batches: int = 20_000,
@@ -175,13 +175,17 @@ def train(
     left_frac: float = 0.9,
     model_name: str = "EleutherAI/pythia-70m",
     warmup_steps: int = 200,
+    max_norm: float = 1.0,
     version: str = VERSION,
 ):
     config = locals().copy()
 
-    double_ntp = GPTNeoXForDoubleCausalLM.from_name(model_name).cuda()
-    optimizer = Lion(double_ntp.parameters(), lr=lr)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = GPTNeoXForDoubleCausalLM.from_name(model_name).cuda()
+    double_ntp = torch.compile(model)
+
+    optimizer = Lion(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler()
 
     text_gen = get_text_gen()
     code_gen = get_code_gen()
@@ -202,7 +206,8 @@ def train(
         for i in range(val_batches):
             left_batch = val_tokens_left[i * val_batch_size : (i + 1) * val_batch_size]
             right_batch = val_tokens_right[i * val_batch_size : (i + 1) * val_batch_size]
-            loss_left, loss_right = double_ntp.get_ntp_losses(to_torch(left_batch), to_torch(right_batch))
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                loss_left, loss_right = double_ntp(to_torch(left_batch), to_torch(right_batch))
             right_losses.append(loss_right.item())
             left_losses.append(loss_left.item())
         return sum(left_losses) / val_batches, sum(right_losses) / val_batches
@@ -216,8 +221,8 @@ def train(
 
     import wandb
 
-    mode = "online"
-    # mode = "offline"
+    # mode = "online"
+    mode = "offline"
     wandb.init(project="double_ntp", name=run_name, config=config, mode=mode)
 
     st = time.time()
@@ -242,13 +247,13 @@ def train(
 
                         left_loss, right_loss = get_val_ntps(left_kind, right_kind)
 
-                        stats[f"right_{left_kind}_{right_kind}"] = right_loss
-                        stats[f"left_{left_kind}_{right_kind}"] = left_loss
-
                         if left_kind != "pad":
+                            stats[f"left_{left_kind}_{right_kind}"] = left_loss
                             all_losses_left.append(left_loss)
                         if right_kind != "pad":
+                            stats[f"right_{left_kind}_{right_kind}"] = right_loss
                             all_losses_right.append(right_loss)
+
                 stats["right_avg"] = sum(all_losses_right) / len(all_losses_right)
                 stats["left_avg"] = sum(all_losses_left) / len(all_losses_left)
                 stats["avg"] = (stats["right_avg"] + stats["left_avg"]) / 2
@@ -258,10 +263,14 @@ def train(
 
             optimizer.zero_grad()
 
-            left_loss, right_loss = double_ntp.get_ntp_losses(to_torch(batch_left), to_torch(batch_right))
-            loss = left_loss + right_loss
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                left_loss, right_loss = double_ntp(to_torch(batch_left), to_torch(batch_right))
+                loss = left_loss + right_loss
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            scaler.step(optimizer)
+            scaler.update()
 
             train_time = time.time() - st
             st = time.time()
@@ -283,20 +292,20 @@ def train(
 
 
 if __name__ == "__main__":
-    # train("test")
-    ray.init()
+    train("test")
+    # ray.init()
 
-    lrs = [6e-5]
-    # right_fracs = [0.01, 0.1, 1, 0]
-    right_fracs = [0, 0.1, 0.9]
+    # lrs = [6e-5]
+    # # right_fracs = [0.01, 0.1, 1, 0]
+    # right_fracs = [0, 0.1, 0.9]
 
-    deps = [
-        train.options(name=f"l{lr}_f{right_frac}_{VERSION}").remote(
-            f"l{lr}_f{right_frac}_{VERSION}", lr=lr, right_frac=right_frac
-        )
-        for lr in lrs
-        for right_frac in right_fracs
-    ]
+    # deps = [
+    #     train.options(name=f"l{lr}_f{right_frac}_{VERSION}").remote(
+    #         f"l{lr}_f{right_frac}_{VERSION}", lr=lr, right_frac=right_frac
+    #     )
+    #     for lr in lrs
+    #     for right_frac in right_fracs
+    # ]
 
-    for dep in deps:
-        ray.get(dep)
+    # for dep in deps:
+    #     ray.get(dep)
