@@ -1,5 +1,7 @@
 from itertools import islice
+import itertools
 import json
+from math import ceil
 import os
 from pathlib import Path
 import time
@@ -9,6 +11,7 @@ import attrs
 from datasets import load_dataset
 import random
 
+import numpy as np
 import ray
 from tqdm import tqdm
 from ray.experimental.tqdm_ray import tqdm as ray_tqdm
@@ -25,40 +28,6 @@ VERSION = "v1.4"
 T = TypeVar("T")
 
 
-def cache_pure_gen(get_gen: Callable[[], Generator[T, None, None]]) -> Callable[[], Generator[T, None, None]]:
-    def new_get_gen():
-        name = get_gen.__name__
-        cache_file = f".cache/{name}.jsonl"
-
-        if not os.path.exists(cache_file):
-            os.makedirs(".cache", exist_ok=True)
-            Path(cache_file).write_text("")
-            print(f"Cache file {cache_file} created")
-
-        lines_loaded = 0
-        lineset = set()
-        with open(cache_file) as f:
-            for line in f:
-                if line and line not in lineset:
-                    lineset.add(line)
-                    yield json.loads(line)
-                    lines_loaded += 1
-
-        print(f"Loaded {lines_loaded} lines from cache file {cache_file}")
-
-        gen = get_gen()
-        for _ in range(lines_loaded):
-            next(gen)
-
-        with open(cache_file, "a") as f:
-            for item in gen:
-                f.write(json.dumps(item) + "\n")
-                yield item
-
-    return new_get_gen
-
-
-@cache_pure_gen
 def get_text_gen() -> Generator[str, None, None]:
     print("Loading text data")
     data = load_dataset("allenai/c4", "en", split="train", streaming=True)
@@ -68,10 +37,7 @@ def get_text_gen() -> Generator[str, None, None]:
             print(f"Text {i}")
         yield row["text"]
 
-    raise StopIteration()
 
-
-@cache_pure_gen
 def get_code_gen() -> Generator[str, None, None]:
     print("Loading code data")
     data = load_dataset("codeparrot/github-code", split="train", streaming=True)
@@ -81,13 +47,10 @@ def get_code_gen() -> Generator[str, None, None]:
             print(f"Code {i}")
         yield row["code"]
 
-    raise StopIteration()
-
 
 def get_gen_mix(
     a_gen: Generator[T, None, None], b_gen: Generator[T, None, None], p_b: float
 ) -> Generator[T, None, None]:
-    """Return a balanced mixed. c4 text is ~3x smaller than codeparrot code"""
     rng = random.Random(0)
 
     while True:
@@ -98,6 +61,35 @@ def get_gen_mix(
             yield next(a_gen)
 
 
+def get_gen_multi_mix(
+    a_gen_left: Generator[T, None, None],
+    b_gen_left: Generator[T, None, None],
+    a_gen_right: Generator[T, None, None],
+    b_gen_right: Generator[T, None, None],
+    p_aa: float,
+    p_ab: float,
+    p_ba: float,
+    p_bb: float,
+) -> Generator[tuple[T, T], None, None]:
+    rng = random.Random(0)
+
+    assert p_aa + p_ab + p_ba + p_bb == 1
+
+    while True:
+        try:
+            u = rng.random()
+            if u < p_aa:
+                yield next(a_gen_left), next(a_gen_right)
+            elif u < p_aa + p_ab:
+                yield next(a_gen_left), next(b_gen_right)
+            elif u < p_aa + p_ab + p_ba:
+                yield next(b_gen_left), next(a_gen_right)
+            else:
+                yield next(b_gen_left), next(b_gen_right)
+        except StopIteration:
+            return
+
+
 def get_tokens(
     s_gen: Generator[str, None, None],
     tokenizer: AutoTokenizer,
@@ -106,12 +98,7 @@ def get_tokens(
 ) -> Generator[list[int], None, None]:
     eos_token = tokenizer.eos_token_id
     current = []
-    # for s in s_gen:
-    #     current += tokenizer.encode(s, add_special_tokens=False) + [eos_token]
-    #     if len(current) >= seq_len:
-    #         yield current[:seq_len]
-    #         current = current[seq_len : 2 * seq_len]  # intentionally don't keep more than 2 fragments
-    # raise StopIteration()
+
     while True:
         new_sequences = []
         for _ in range(tokenization_batch_size):
@@ -132,10 +119,10 @@ def get_eos_tokens(tokenizer: AutoTokenizer, seq_len: int) -> Generator[list[int
 
 
 def get_batched(
-    tok_gen: Generator[list[int], None, None],
+    tok_gen: Generator[T, None, None],
     batch_size: int,
     buffer_size: int = 10_000,
-) -> Generator[list[list[int]], None, None]:
+) -> Generator[list[T], None, None]:
     rng = random.Random(0)
 
     toks = []
@@ -145,8 +132,6 @@ def get_batched(
             sampled_idxs = set(rng.sample(range(len(toks)), batch_size))
             yield [toks[i] for i in sampled_idxs]
             toks = [t for i, t in enumerate(toks) if i not in sampled_idxs]
-
-    raise StopIteration()
 
 
 data_kinds = ["text", "code", "pad"]
@@ -161,41 +146,111 @@ log_file = "log.txt"
 Path(log_file).write_text("")
 
 
+def get_cached_toks(
+    gen: Generator[T, None, None], n: int, name: str, entries_per_file: int = 10_000
+) -> Generator[T, None, None]:
+    save_folder = f".cache/{name}_{n}"
+
+    if os.path.exists(save_folder):
+        for i in itertools.count():
+            if not os.path.exists(f"{save_folder}/{i}.npy"):
+                return
+            array = np.load(f"{save_folder}/{i}.npy")
+            for item in array:
+                yield item
+
+    os.makedirs(save_folder, exist_ok=True)
+    c = 0
+    items = []
+    for i in range(n):
+        try:
+            item = next(gen)
+        except StopIteration:
+            raise ValueError(f"Not enough items {i} < {n} for {name} generator")
+
+        items.append(item)
+        if len(items) == entries_per_file:
+            np.save(f"{save_folder}/{c}.npy", np.array(items))
+            c += 1
+            items = []
+        yield item
+    if items:
+        np.save(f"{save_folder}/{c}.npy", np.array(items))
+
+
 # @ray.remote(num_gpus=1)
 def train(
     run_name: str,
-    train_batches: int = 20_000,
+    train_seqs: int = 4_000_000,
+    val_seqs: int = 256,
     train_batch_size: int = 100,
     val_batch_size: int = 100,
-    val_batches: int = 1,
     seq_len: int = 512,
     lr: float = 1e-4,
     eval_every: int = 20,
     right_frac: float = 0.1,
-    left_frac: float = 0.9,
+    no_left_frac: float = 0.3,
     model_name: str = "EleutherAI/pythia-70m",
     warmup_steps: int = 200,
     max_norm: float = 1.0,
+    only_toks: bool = False,
+    dry_batches: bool = False,
     version: str = VERSION,
 ):
     config = locals().copy()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = GPTNeoXForDoubleCausalLM.from_name(model_name).cuda()
-    double_ntp = torch.compile(model)
-
-    optimizer = Lion(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler()
 
     text_gen = get_text_gen()
     code_gen = get_code_gen()
     eos_token_gen = get_eos_tokens(tokenizer, seq_len)
 
     val_tokens = {
-        "text": list(islice(get_tokens(text_gen, tokenizer, seq_len), val_batch_size * val_batches)),
-        "code": list(islice(get_tokens(code_gen, tokenizer, seq_len), val_batch_size * val_batches)),
-        "pad": list(islice(eos_token_gen, val_batch_size * val_batches)),
+        "text": list(get_cached_toks(get_tokens(text_gen, tokenizer, seq_len), val_seqs, "val_text")),
+        "code": list(get_cached_toks(get_tokens(code_gen, tokenizer, seq_len), val_seqs, "val_code")),
+        "pad": list(islice(eos_token_gen, val_seqs)),
     }
+
+    mix_gen = get_gen_mix(text_gen, code_gen, p_b=0.25)  # code is 3x larger than text
+
+    if only_toks:
+        for _ in ray_tqdm(
+            get_cached_toks(get_tokens(mix_gen, tokenizer, seq_len), train_seqs, "train_left"), total=train_seqs
+        ):
+            pass
+        for _ in ray_tqdm(
+            get_cached_toks(get_tokens(mix_gen, tokenizer, seq_len), train_seqs, "train_right"), total=train_seqs
+        ):
+            pass
+        return
+    # separate get_tokens since there is overlap between tokens
+    train_gen = get_gen_multi_mix(
+        get_cached_toks(get_tokens(mix_gen, tokenizer, seq_len), train_seqs, "train_left"),
+        eos_token_gen,
+        get_cached_toks(get_tokens(mix_gen, tokenizer, seq_len), train_seqs, "train_right"),
+        eos_token_gen,
+        p_aa=right_frac * (1 - no_left_frac),
+        p_ab=1 - right_frac,
+        p_ba=right_frac * no_left_frac,
+        p_bb=0,
+    )
+    batched = get_batched(train_gen, train_batch_size)
+
+    if dry_batches:
+        for name, toks in val_tokens.items():
+            print(f"Val {name}: {len(toks)}")
+        c = 0
+        for _ in ray_tqdm(batched, total=train_seqs // train_batch_size):
+            c += 1
+        print(f"Generated {c} batches")
+        return
+
+    model = GPTNeoXForDoubleCausalLM.from_name(model_name).cuda()
+    torch.set_float32_matmul_precision("high")
+    double_ntp = torch.compile(model)
+
+    optimizer = Lion(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler()
 
     @torch.no_grad
     def get_val_ntps(left_kind: DataKind, right_kind: DataKind) -> torch.Tensor:
@@ -203,21 +258,15 @@ def train(
         val_tokens_right = val_tokens[right_kind]
         left_losses = []
         right_losses = []
+        val_batches = ceil(len(val_tokens_left) / val_batch_size)
         for i in range(val_batches):
             left_batch = val_tokens_left[i * val_batch_size : (i + 1) * val_batch_size]
             right_batch = val_tokens_right[i * val_batch_size : (i + 1) * val_batch_size]
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 loss_left, loss_right = double_ntp(to_torch(left_batch), to_torch(right_batch))
-            right_losses.append(loss_right.item())
-            left_losses.append(loss_left.item())
-        return sum(left_losses) / val_batches, sum(right_losses) / val_batches
-
-    mix_gen = get_gen_mix(text_gen, code_gen, p_b=0.25)  # code is 3x larger than text
-
-    # separate get_tokens since there is overlap between tokens
-    left_gen = get_gen_mix(eos_token_gen, get_tokens(mix_gen, tokenizer, seq_len), p_b=left_frac)
-    right_gen = get_gen_mix(eos_token_gen, get_tokens(mix_gen, tokenizer, seq_len), p_b=right_frac)
-    train_gen = zip(get_batched(left_gen, train_batch_size), get_batched(right_gen, train_batch_size))
+            right_losses.append(loss_right.item() * len(right_batch))
+            left_losses.append(loss_left.item() * len(left_batch))
+        return sum(left_losses) / len(val_tokens_left), sum(right_losses) / len(val_tokens_right)
 
     import wandb
 
@@ -226,7 +275,7 @@ def train(
     wandb.init(project="double_ntp", name=run_name, config=config, mode=mode)
 
     st = time.time()
-    for i, (batch_left, batch_right) in enumerate(ray_tqdm(train_gen, total=train_batches)):
+    for i, batch in enumerate(ray_tqdm(batched, total=train_seqs // train_batch_size)):
         try:
             data_time = time.time() - st
             st = time.time()
@@ -263,8 +312,10 @@ def train(
 
             optimizer.zero_grad()
 
+            batch_left, right_batch = zip(*batch)
+
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                left_loss, right_loss = double_ntp(to_torch(batch_left), to_torch(batch_right))
+                left_loss, right_loss = double_ntp(to_torch(batch_left), to_torch(right_batch))
                 loss = left_loss + right_loss
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -292,7 +343,10 @@ def train(
 
 
 if __name__ == "__main__":
-    train("test")
+    train("test", only_toks=True, train_seqs=512)
+    train("test", dry_batches=True, train_seqs=512)
+    train("test", only_toks=True)
+    train("test", dry_batches=True)
     # ray.init()
 
     # lrs = [6e-5]
