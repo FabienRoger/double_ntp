@@ -21,7 +21,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, StableLmForCausalL
 from model import GPTNeoXForDoubleCausalLM
 from lion_pytorch import Lion
 
-VERSION = "v1.4"
+VERSION = "v2.3"
 
 # Note: I assume datasets are shuffled
 
@@ -139,7 +139,7 @@ DataKind = Literal["text", "code", "pad"]
 
 
 def to_torch(tokens: list[list[int]]) -> torch.Tensor:
-    return torch.tensor(tokens, dtype=torch.long).cuda()
+    return torch.tensor(np.array(tokens), dtype=torch.long).cuda()
 
 
 log_file = "log.txt"
@@ -155,10 +155,13 @@ def get_cached_toks(
         for i in itertools.count():
             if not os.path.exists(f"{save_folder}/{i}.npy"):
                 return
+            print(f"Loading {name} {i}")
             array = np.load(f"{save_folder}/{i}.npy")
             for item in array:
                 yield item
+        return
 
+    print(f"Cache {name} not found, generating")
     os.makedirs(save_folder, exist_ok=True)
     c = 0
     items = []
@@ -178,7 +181,7 @@ def get_cached_toks(
         np.save(f"{save_folder}/{c}.npy", np.array(items))
 
 
-# @ray.remote(num_gpus=1)
+@ray.remote(num_gpus=1)
 def train(
     run_name: str,
     train_seqs: int = 4_000_000,
@@ -187,9 +190,9 @@ def train(
     val_batch_size: int = 100,
     seq_len: int = 512,
     lr: float = 1e-4,
-    eval_every: int = 20,
+    eval_ratio: int = 20,  # how many batches of eval per batch of train
     right_frac: float = 0.1,
-    no_left_frac: float = 0.3,
+    no_left_frac: float = 1 / 3,
     model_name: str = "EleutherAI/pythia-70m",
     warmup_steps: int = 200,
     max_norm: float = 1.0,
@@ -223,6 +226,7 @@ def train(
         ):
             pass
         return
+
     # separate get_tokens since there is overlap between tokens
     train_gen = get_gen_multi_mix(
         get_cached_toks(get_tokens(mix_gen, tokenizer, seq_len), train_seqs, "train_left"),
@@ -245,12 +249,15 @@ def train(
         print(f"Generated {c} batches")
         return
 
-    model = GPTNeoXForDoubleCausalLM.from_name(model_name).cuda()
+    double_ntp = GPTNeoXForDoubleCausalLM.from_name(model_name).cuda()
     torch.set_float32_matmul_precision("high")
-    double_ntp = torch.compile(model)
+    double_ntp = torch.compile(double_ntp)
+    print("Model loaded")
 
-    optimizer = Lion(model.parameters(), lr=lr)
+    optimizer = Lion(double_ntp.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler()
+
+    eval_every = ceil(eval_ratio * val_seqs / val_batch_size)
 
     @torch.no_grad
     def get_val_ntps(left_kind: DataKind, right_kind: DataKind) -> torch.Tensor:
@@ -270,12 +277,13 @@ def train(
 
     import wandb
 
-    # mode = "online"
-    mode = "offline"
+    mode = "online"
+    # mode = "offline"
     wandb.init(project="double_ntp", name=run_name, config=config, mode=mode)
 
     st = time.time()
-    for i, batch in enumerate(ray_tqdm(batched, total=train_seqs // train_batch_size)):
+    pbar = ray_tqdm(batched, total=train_seqs // train_batch_size)
+    for i, batch in enumerate(pbar):
         try:
             data_time = time.time() - st
             st = time.time()
@@ -319,7 +327,7 @@ def train(
                 loss = left_loss + right_loss
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            torch.nn.utils.clip_grad_norm_(double_ntp.parameters(), max_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -333,6 +341,11 @@ def train(
             stats["eval_time"] = eval_time
             stats["train_time"] = train_time
 
+            pbar.set_description(f"loss={loss.item():.3f}")
+
+            # wandb.finish()
+            # return
+
             wandb.log(stats)
 
         except Exception as e:
@@ -343,23 +356,36 @@ def train(
 
 
 if __name__ == "__main__":
-    train("test", only_toks=True, train_seqs=512)
-    train("test", dry_batches=True, train_seqs=512)
-    train("test", only_toks=True)
-    train("test", dry_batches=True)
-    # ray.init()
+    # train("test", only_toks=True, train_seqs=512)
+    # train("test", dry_batches=True, train_seqs=512)
+    # train("test", only_toks=True)
+    # train("test", dry_batches=True)
+    # train("test", model_name="EleutherAI/pythia-70m", train_batch_size=110)
+    # train("test", model_name="EleutherAI/pythia-160m", train_batch_size=70)
+    # train("test", model_name="EleutherAI/pythia-410m", train_batch_size=40)
+    # train("test", dry_batches=True)
+    ray.init()
 
-    # lrs = [6e-5]
-    # # right_fracs = [0.01, 0.1, 1, 0]
-    # right_fracs = [0, 0.1, 0.9]
+    lrs = [6e-5, 3e-5]
+    # right_fracs = [0.01, 0.1, 1, 0]
+    right_fracs = [0.1, 0, 0.01, 0.9]
+    models = ["EleutherAI/pythia-70m", "EleutherAI/pythia-160m", "EleutherAI/pythia-410m"]
+    model_shorthands = [m.split("-")[-1] for m in models]
+    batch_sizes = [110, 70, 40]
 
-    # deps = [
-    #     train.options(name=f"l{lr}_f{right_frac}_{VERSION}").remote(
-    #         f"l{lr}_f{right_frac}_{VERSION}", lr=lr, right_frac=right_frac
-    #     )
-    #     for lr in lrs
-    #     for right_frac in right_fracs
-    # ]
+    deps = [
+        train.options(name=f"{short}_l{lr}_f{right_frac}_{VERSION}").remote(
+            f"{short}_l{lr}_f{right_frac}_{VERSION}",
+            lr=lr,
+            right_frac=right_frac,
+            model_name=model_name,
+            train_batch_size=batch_size,
+            val_batch_size=batch_size,
+        )
+        for lr in lrs
+        for right_frac in right_fracs
+        for short, model_name, batch_size in zip(model_shorthands, models, batch_sizes)
+    ]
 
-    # for dep in deps:
-    #     ray.get(dep)
+    for dep in deps:
+        ray.get(dep)
