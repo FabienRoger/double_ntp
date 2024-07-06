@@ -21,7 +21,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, StableLmForCausalL
 from model import GPTNeoXForDoubleCausalLM
 from lion_pytorch import Lion
 
-VERSION = "v2.5"
+VERSION = "v2.6"
 
 # Note: I assume datasets are shuffled
 
@@ -200,6 +200,9 @@ def train(
     dry_batches: bool = False,
     version: str = VERSION,
 ):
+    if Path(f".touch/{run_name}").exists():
+        return
+
     config = locals().copy()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -238,13 +241,14 @@ def train(
         p_ba=right_frac * no_left_frac,
         p_bb=0,
     )
-    batched = get_batched(train_gen, train_batch_size)
+    nb_train_batches = train_seqs // train_batch_size
+    batched = islice(get_batched(train_gen, train_batch_size), nb_train_batches)
 
     if dry_batches:
         for name, toks in val_tokens.items():
             print(f"Val {name}: {len(toks)}")
         c = 0
-        for batch in ray_tqdm(batched, total=train_seqs // train_batch_size):
+        for batch in ray_tqdm(batched, total=nb_train_batches):
             left, right = zip(*batch)
             c += 1
             left_batch = to_torch(left)
@@ -291,7 +295,7 @@ def train(
     wandb.init(project="double_ntp", name=run_name, config=config, mode=mode)
 
     st = time.time()
-    pbar = ray_tqdm(batched, total=train_seqs // train_batch_size)
+    pbar = ray_tqdm(batched, total=nb_train_batches)
     for i, batch in enumerate(pbar):
         try:
             data_time = time.time() - st
@@ -363,6 +367,10 @@ def train(
                 f.write(traceback.format_exc())
             raise e
 
+    wandb.finish()
+    os.makedirs(".touch", exist_ok=True)
+    Path(f".touch/{run_name}").touch()
+
 
 if __name__ == "__main__":
     # train("test", only_toks=True, train_seqs=512)
@@ -381,7 +389,8 @@ if __name__ == "__main__":
     models = ["EleutherAI/pythia-70m", "EleutherAI/pythia-160m", "EleutherAI/pythia-410m"]
     model_shorthands = [m.split("-")[-1] for m in models]
     batch_sizes = [110, 80, 60]
-    lr_multipliers = [1, 0.6, 0.3]  # from the pythia github repo
+    lr_multipliers_ = [1, 0.6, 0.3]  # from the pythia github repo
+    lr_multipliers = [lr * batch_size / batch_sizes[0] for lr, batch_size in zip(lr_multipliers_, batch_sizes)]
 
     deps = [
         train.options(name=f"{short}_l{lr}_f{right_frac}_{VERSION}").remote(

@@ -3,3 +3,4 @@ profile.svg
 wandb
 log.txt
 .cache
+.touch

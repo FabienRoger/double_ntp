@@ -56,8 +56,13 @@ class GPTNeoXForDoubleCausalLM(torch.nn.Module):
             input_ids_right[not_only_pad_right],
         )
 
-        loss_left *= not_only_pad_left.mean(dtype=loss_left.dtype)
-        loss_right *= not_only_pad_right.mean(dtype=loss_right.dtype)
+        scale_left = not_only_pad_left.mean(dtype=loss_left.dtype)
+        scale_right = not_only_pad_right.mean(dtype=loss_right.dtype)
+        assert scale_left > 0 or scale_right > 0
+        zero = torch.tensor(0.0, device=loss_left.device)
+
+        loss_left = loss_left * scale_left if scale_left > 0 else zero
+        loss_right = loss_right * scale_right if scale_right > 0 else zero
 
         return loss_left, loss_right
 
