@@ -25,6 +25,7 @@ class GPTNeoXForDoubleCausalLM(torch.nn.Module):
     embed_adapter: nn.Linear
     unembed_adapter: nn.Linear
     eos_token_id: int
+    skip_pad: bool = True
 
     def __init__(self, backbone, embed_adapter, unembed_adapter, eos_token_id):
         super().__init__()
@@ -34,8 +35,8 @@ class GPTNeoXForDoubleCausalLM(torch.nn.Module):
         self.eos_token_id = eos_token_id
 
     def forward(self, input_ids_left: torch.Tensor, input_ids_right: torch.Tensor):
-        not_only_pad_left = (input_ids_left != self.eos_token_id).any(dim=-1)
-        not_only_pad_right = (input_ids_right != self.eos_token_id).any(dim=-1)
+        not_only_pad_left = (input_ids_left != self.eos_token_id).any(dim=-1) | (not self.skip_pad)
+        not_only_pad_right = (input_ids_right != self.eos_token_id).any(dim=-1) | (not self.skip_pad)
         assert (
             not_only_pad_left.shape
             == (input_ids_left.shape[0],)
